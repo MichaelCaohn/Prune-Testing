@@ -45,10 +45,13 @@ class PruningModule(Module):
         I tried multiple values and empirically, 0.25 matches the paper's compression rate and number of parameters.
         Note : In the paper, the authors used different sensitivity values for different layers.
         """
+        # did not include dropout layer, activation layer "word_embeddings", "position_embeddings", "token_type_embeddings", "LayerNorm"
+        target = ["query", "key", "value", "dense", "classifier"]
         for name, module in self.named_modules():
-            if name in ['fc1', 'fc2', 'fc3']:
+            if any(key in name for key in target):
                 threshold = np.std(module.weight.data.cpu().numpy()) * s
                 print(f'Pruning with threshold : {threshold} for layer {name}')
+                # print(module)
                 module.prune(threshold)
 
 

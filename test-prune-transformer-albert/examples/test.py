@@ -23,8 +23,7 @@ sys.path.append("..")
 import csv
 maxInt = 200000
 csv.field_size_limit(maxInt)
-
-import prune
+import util
 
 import argparse
 import glob
@@ -134,8 +133,6 @@ def train(args, train_dataset, model, tokenizer):
     ]
 
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-    # Add saving the state of the optimizer
-    initial_optimizer_state_dict = optimizer.state_dict()
     scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
     if args.fp16:
         try:
@@ -220,6 +217,8 @@ def train(args, train_dataset, model, tokenizer):
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
                     # Save model checkpoint
                     output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
+                    if args.doing_prune:
+                        output_dir = os.path.join(args.output_dir, 'pruned_weight-checkpoint-{}'.format(global_step))
                     if not os.path.exists(output_dir):
                         os.makedirs(output_dir)
                     model_to_save = model.module if hasattr(model,
@@ -396,12 +395,15 @@ def main():
                         help="Whether to run training.")
     parser.add_argument("--do_eval", action='store_true',
                         help="Whether to run eval on the dev set.")
-    parser.add_argument("--prune", default=False, type=bool,
-                        help="Whether to run eval on the dev set.")
     parser.add_argument("--evaluate_during_training", action='store_true',
                         help="Rul evaluation during training at each logging step.")
     parser.add_argument("--do_lower_case", action='store_true',
                         help="Set this flag if you are using an uncased model.")
+
+    parser.add_argument('--prune_weight', type=bool, default=False,
+                        help="Whether to prune the weights of the network")
+    parser.add_argument('--sensitivity', type=float, default=0.25,
+                        help="sensitivity value that is multiplied to layer's std in order to get threshold value")
 
     parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for training.")
@@ -457,8 +459,10 @@ def main():
                         help="For distributed training: local_rank")
     parser.add_argument('--server_ip', type=str, default='', help="For distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="For distant debugging.")
+    parser.add_argument('--doing_prune', type=bool, default=False, help="Pruning process.")
+    parser.add_argument('--log', type=str, default='log.txt', help='log file name')
     args = parser.parse_args()
-
+    prune_mask = args.prune_weight
     args.do_train = True
     args.do_eval = True
     args.do_lower_case = True
@@ -534,7 +538,7 @@ def main():
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
                                                 do_lower_case=args.do_lower_case)
     model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path),
-                                        config=config)
+                                        config=config, prune_mask=prune_mask)
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
@@ -567,7 +571,7 @@ def main():
         torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
 
         # Load a trained model and vocabulary that you have fine-tuned
-        model = model_class.from_pretrained(args.output_dir)
+        model = model_class.from_pretrained(args.output_dir, prune_mask=prune_mask)
         tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
         model.to(args.device)
 
@@ -585,16 +589,37 @@ def main():
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
             prefix = checkpoint.split('/')[-1] if checkpoint.find('checkpoint') != -1 else ""
 
-            model = model_class.from_pretrained(checkpoint)
+            model = model_class.from_pretrained(checkpoint, prune_mask=prune_mask)
             model.to(args.device)
             result = evaluate(args, model, tokenizer, prefix=prefix)
             result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
             results.update(result)
-    # Pruning the network
-    if args.prune:
-        model.prune_by_std(args.sensitivity)
-    return results
 
+    #weight pruning:
+    print(model)
+    if args.prune_weight:
+        # Pruning
+        args.doing_prune = True
+        model.prune_by_std(args.sensitivity)
+        accuracy = evaluate(args, model, tokenizer, prefix=prefix)
+        print(args.log)
+        util.log(args.log, f"accuracy_after_pruning {accuracy}")
+        print("--- After pruning ---")
+        util.print_nonzeros(model)
+
+        # Retrain
+        print("--- Retraining ---")
+        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+        logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
+        save_path = args.output_dir+"/model_after_retraining.ptmodel"
+        torch.save(model, save_path)
+        accuracy = evaluate(args, model, tokenizer, prefix=prefix)
+        util.log(args.log, f"accuracy_after_retraining {accuracy}")
+
+        print("--- After Retraining ---")
+        util.print_nonzeros(model)                    
+    # return results
 
 if __name__ == "__main__":
     main()

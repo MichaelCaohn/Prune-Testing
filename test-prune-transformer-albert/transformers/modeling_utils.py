@@ -30,6 +30,7 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.nn import functional as F
 
+from .net.prune import PruningModule
 from .configuration_utils import PretrainedConfig
 from .file_utils import cached_path, WEIGHTS_NAME, TF_WEIGHTS_NAME, TF2_WEIGHTS_NAME
 
@@ -49,7 +50,7 @@ except ImportError:
         def forward(self, input):
             return input
 
-class PreTrainedModel(nn.Module):
+class PreTrainedModel(PruningModule):
     r""" Base class for all models.
 
         :class:`~transformers.PreTrainedModel` takes care of storing the configuration of the models and handles methods for loading/downloading/saving models
@@ -277,6 +278,7 @@ class PreTrainedModel(nn.Module):
         force_download = kwargs.pop('force_download', False)
         proxies = kwargs.pop('proxies', None)
         output_loading_info = kwargs.pop('output_loading_info', False)
+        prune_mask = kwargs.pop('prune_mask', False)
 
         # Load config
         if config is None:
@@ -339,7 +341,7 @@ class PreTrainedModel(nn.Module):
             resolved_archive_file = None
 
         # Instantiate model.
-        model = cls(config, *model_args, **model_kwargs)
+        model = cls(config, prune_mask, *model_args, **model_kwargs)
 
         if state_dict is None and not from_tf:
             state_dict = torch.load(resolved_archive_file, map_location='cpu')

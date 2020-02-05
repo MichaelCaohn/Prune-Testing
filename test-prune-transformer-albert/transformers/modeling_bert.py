@@ -31,6 +31,7 @@ from torch.nn import CrossEntropyLoss, MSELoss
 from .modeling_utils import PreTrainedModel, prune_linear_layer
 from .configuration_bert import BertConfig
 from .file_utils import add_start_docstrings
+from .net.prune import PruningModule, MaskedLinear
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +143,7 @@ ACT2FN = {"gelu": gelu, "relu": torch.nn.functional.relu, "swish": swish, "gelu_
 
 BertLayerNorm = torch.nn.LayerNorm
 
-class BertEmbeddings(nn.Module):
+class BertEmbeddings(PruningModule):
     """Construct the embeddings from word, position and token_type embeddings.
     """
     def __init__(self, config):
@@ -174,8 +175,8 @@ class BertEmbeddings(nn.Module):
         return embeddings
 
 
-class BertSelfAttention(nn.Module):
-    def __init__(self, config):
+class BertSelfAttention(PruningModule):
+    def __init__(self, config, prune_mask=False):
         super(BertSelfAttention, self).__init__()
         if config.hidden_size % config.num_attention_heads != 0:
             raise ValueError(
@@ -187,9 +188,13 @@ class BertSelfAttention(nn.Module):
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        linear = MaskedLinear if prune_mask else nn.Linear
+        self.query = linear(config.hidden_size, self.all_head_size)
+        self.key = linear(config.hidden_size, self.all_head_size)
+        self.value = linear(config.hidden_size, self.all_head_size)
+        # self.query = nn.Linear(config.hidden_size, self.all_head_size)
+        # self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        # self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
@@ -235,10 +240,13 @@ class BertSelfAttention(nn.Module):
         return outputs
 
 
-class BertSelfOutput(nn.Module):
-    def __init__(self, config):
+class BertSelfOutput(PruningModule):
+    def __init__(self, config, prune_mask=False):
         super(BertSelfOutput, self).__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        
+        linear = MaskedLinear if prune_mask else nn.Linear
+        self.dense = linear(config.hidden_size, config.hidden_size)
+        # self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
@@ -249,11 +257,11 @@ class BertSelfOutput(nn.Module):
         return hidden_states
 
 
-class BertAttention(nn.Module):
-    def __init__(self, config):
+class BertAttention(PruningModule):
+    def __init__(self, config, prune_mask=False):
         super(BertAttention, self).__init__()
-        self.self = BertSelfAttention(config)
-        self.output = BertSelfOutput(config)
+        self.self = BertSelfAttention(config, prune_mask)
+        self.output = BertSelfOutput(config, prune_mask)
         self.pruned_heads = set()
 
     def prune_heads(self, heads):
@@ -286,10 +294,11 @@ class BertAttention(nn.Module):
         return outputs
 
 
-class BertIntermediate(nn.Module):
-    def __init__(self, config):
+class BertIntermediate(PruningModule):
+    def __init__(self, config, prune_mask=False):
         super(BertIntermediate, self).__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        linear = MaskedLinear if prune_mask else nn.Linear
+        self.dense = linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str) or (sys.version_info[0] == 2 and isinstance(config.hidden_act, unicode)):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -301,10 +310,11 @@ class BertIntermediate(nn.Module):
         return hidden_states
 
 
-class BertOutput(nn.Module):
-    def __init__(self, config):
+class BertOutput(PruningModule):
+    def __init__(self, config, prune_mask=False):
         super(BertOutput, self).__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        linear = MaskedLinear if prune_mask else nn.Linear
+        self.dense = linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
@@ -315,12 +325,12 @@ class BertOutput(nn.Module):
         return hidden_states
 
 
-class BertLayer(nn.Module):
-    def __init__(self, config):
+class BertLayer(PruningModule):
+    def __init__(self, config, prune_mask=False):
         super(BertLayer, self).__init__()
-        self.attention = BertAttention(config)
-        self.intermediate = BertIntermediate(config)
-        self.output = BertOutput(config)
+        self.attention = BertAttention(config, prune_mask)
+        self.intermediate = BertIntermediate(config, prune_mask)
+        self.output = BertOutput(config, prune_mask)
 
     def forward(self, hidden_states, attention_mask=None, head_mask=None):
         attention_outputs = self.attention(hidden_states, attention_mask, head_mask)
@@ -331,12 +341,12 @@ class BertLayer(nn.Module):
         return outputs
 
 
-class BertEncoder(nn.Module):
-    def __init__(self, config):
+class BertEncoder(PruningModule):
+    def __init__(self, config, prune_mask=False):
         super(BertEncoder, self).__init__()
         self.output_attentions = config.output_attentions
         self.output_hidden_states = config.output_hidden_states
-        self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layer = nn.ModuleList([BertLayer(config, prune_mask) for _ in range(config.num_hidden_layers)])
 
     def forward(self, hidden_states, attention_mask=None, head_mask=None):
         all_hidden_states = ()
@@ -363,10 +373,11 @@ class BertEncoder(nn.Module):
         return outputs  # last-layer hidden state, (all hidden states), (all attentions)
 
 
-class BertPooler(nn.Module):
-    def __init__(self, config):
+class BertPooler(PruningModule):
+    def __init__(self, config, prune_mask=False):
         super(BertPooler, self).__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        linear = MaskedLinear if prune_mask else nn.Linear
+        self.dense = linear(config.hidden_size, config.hidden_size)
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states):
@@ -378,10 +389,11 @@ class BertPooler(nn.Module):
         return pooled_output
 
 
-class BertPredictionHeadTransform(nn.Module):
-    def __init__(self, config):
+class BertPredictionHeadTransform(PruningModule):
+    def __init__(self, config, prune_mask=False):
         super(BertPredictionHeadTransform, self).__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        linear = MaskedLinear if prune_mask else nn.Linear
+        self.dense = linear(config.hidden_size, config.hidden_size)
         if isinstance(config.hidden_act, str) or (sys.version_info[0] == 2 and isinstance(config.hidden_act, unicode)):
             self.transform_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -395,14 +407,15 @@ class BertPredictionHeadTransform(nn.Module):
         return hidden_states
 
 
-class BertLMPredictionHead(nn.Module):
-    def __init__(self, config):
+class BertLMPredictionHead(PruningModule):
+    def __init__(self, config, prune_mask=False):
         super(BertLMPredictionHead, self).__init__()
-        self.transform = BertPredictionHeadTransform(config)
+        self.transform = BertPredictionHeadTransform(config, prune_mask)
 
         # The output weights are the same as the input embeddings, but there is
         # an output-only bias for each token.
-        self.decoder = nn.Linear(config.hidden_size,
+        linear = MaskedLinear if prune_mask else nn.Linear
+        self.decoder = linear(config.hidden_size,
                                  config.vocab_size,
                                  bias=False)
 
@@ -414,31 +427,33 @@ class BertLMPredictionHead(nn.Module):
         return hidden_states
 
 
-class BertOnlyMLMHead(nn.Module):
-    def __init__(self, config):
+class BertOnlyMLMHead(PruningModule):
+    def __init__(self, config, prune_mask=False):
         super(BertOnlyMLMHead, self).__init__()
-        self.predictions = BertLMPredictionHead(config)
+        self.predictions = BertLMPredictionHead(config, prune_mask)
 
     def forward(self, sequence_output):
         prediction_scores = self.predictions(sequence_output)
         return prediction_scores
 
 
-class BertOnlyNSPHead(nn.Module):
-    def __init__(self, config):
+class BertOnlyNSPHead(PruningModule):
+    def __init__(self, config, prune_mask=False):
         super(BertOnlyNSPHead, self).__init__()
-        self.seq_relationship = nn.Linear(config.hidden_size, 2)
+        linear = MaskedLinear if prune_mask else nn.Linear
+        self.seq_relationship = linear(config.hidden_size, 2)
 
     def forward(self, pooled_output):
         seq_relationship_score = self.seq_relationship(pooled_output)
         return seq_relationship_score
 
 
-class BertPreTrainingHeads(nn.Module):
-    def __init__(self, config):
+class BertPreTrainingHeads(PruningModule):
+    def __init__(self, config, prune_mask=False):
         super(BertPreTrainingHeads, self).__init__()
-        self.predictions = BertLMPredictionHead(config)
-        self.seq_relationship = nn.Linear(config.hidden_size, 2)
+        self.predictions = BertLMPredictionHead(config, prune_mask)
+        linear = MaskedLinear if prune_mask else nn.Linear
+        self.seq_relationship = linear(config.hidden_size, 2)
 
     def forward(self, sequence_output, pooled_output):
         prediction_scores = self.predictions(sequence_output)
@@ -457,14 +472,16 @@ class BertPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         """ Initialize the weights """
-        if isinstance(module, (nn.Linear, nn.Embedding)):
+        # if isinstance(module, (nn.Linear, nn.Embedding)):
+        if isinstance(module, (MaskedLinear, nn.Embedding)):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, BertLayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
-        if isinstance(module, nn.Linear) and module.bias is not None:
+        # if isinstance(module, nn.Linear) and module.bias is not None:
+        if isinstance(module, MaskedLinear) and module.bias is not None:
             module.bias.data.zero_()
 
 
@@ -562,12 +579,12 @@ class BertModel(BertPreTrainedModel):
         last_hidden_states = outputs[0]  # The last hidden-state is the first element of the output tuple
 
     """
-    def __init__(self, config):
-        super(BertModel, self).__init__(config)
+    def __init__(self, config, prune_mask=False):
+        super(BertModel, self).__init__(config, prune_mask)
 
         self.embeddings = BertEmbeddings(config)
-        self.encoder = BertEncoder(config)
-        self.pooler = BertPooler(config)
+        self.encoder = BertEncoder(config, prune_mask)
+        self.pooler = BertPooler(config, prune_mask)
 
         self.init_weights()
 
@@ -672,11 +689,11 @@ class BertForPreTraining(BertPreTrainedModel):
         prediction_scores, seq_relationship_scores = outputs[:2]
 
     """
-    def __init__(self, config):
-        super(BertForPreTraining, self).__init__(config)
+    def __init__(self, config, prune_mask=False):
+        super(BertForPreTraining, self).__init__(config, prune_mask)
 
-        self.bert = BertModel(config)
-        self.cls = BertPreTrainingHeads(config)
+        self.bert = BertModel(config, prune_mask)
+        self.cls = BertPreTrainingHeads(config, prune_mask)
 
         self.init_weights()
         self.tie_weights()
@@ -744,11 +761,11 @@ class BertForMaskedLM(BertPreTrainedModel):
         loss, prediction_scores = outputs[:2]
 
     """
-    def __init__(self, config):
-        super(BertForMaskedLM, self).__init__(config)
+    def __init__(self, config, prune_mask=False):
+        super(BertForMaskedLM, self).__init__(config, prune_mask)
 
-        self.bert = BertModel(config)
-        self.cls = BertOnlyMLMHead(config)
+        self.bert = BertModel(config, prune_mask)
+        self.cls = BertOnlyMLMHead(config, prune_mask)
 
         self.init_weights()
         self.tie_weights()
@@ -813,11 +830,11 @@ class BertForNextSentencePrediction(BertPreTrainedModel):
         seq_relationship_scores = outputs[0]
 
     """
-    def __init__(self, config):
-        super(BertForNextSentencePrediction, self).__init__(config)
+    def __init__(self, config, prune_mask=False):
+        super(BertForNextSentencePrediction, self).__init__(config, prune_mask)
 
-        self.bert = BertModel(config)
-        self.cls = BertOnlyNSPHead(config)
+        self.bert = BertModel(config, prune_mask)
+        self.cls = BertOnlyNSPHead(config, prune_mask)
 
         self.init_weights()
 
@@ -877,19 +894,22 @@ class BertForSequenceClassification(BertPreTrainedModel):
         loss, logits = outputs[:2]
 
     """
-    def __init__(self, config):
-        super(BertForSequenceClassification, self).__init__(config)
+    def __init__(self, config, prune_mask=False):
+        super(BertForSequenceClassification, self).__init__(config, prune_mask)
         self.num_labels = config.num_labels
-
-        self.bert = BertModel(config)
+        # self.prune_mask = prune_mask
+        self.bert = BertModel(config, prune_mask)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = nn.Linear(config.hidden_size, self.config.num_labels)
+        linear = MaskedLinear if prune_mask else nn.Linear
+        self.classifier = linear(config.hidden_size, self.config.num_labels)
 
         self.init_weights()
 
     def forward(self, input_ids, attention_mask=None, token_type_ids=None,
                 position_ids=None, head_mask=None, labels=None):
 
+        # if self.prune_mask:
+        #     print("Weight Pruning!")
         outputs = self.bert(input_ids,
                             attention_mask=attention_mask,
                             token_type_ids=token_type_ids,
@@ -951,12 +971,13 @@ class BertForMultipleChoice(BertPreTrainedModel):
         loss, classification_scores = outputs[:2]
 
     """
-    def __init__(self, config):
-        super(BertForMultipleChoice, self).__init__(config)
+    def __init__(self, config, prune_mask=False):
+        super(BertForMultipleChoice, self).__init__(config, prune_mask)
 
-        self.bert = BertModel(config)
+        self.bert = BertModel(config, prune_mask)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = nn.Linear(config.hidden_size, 1)
+        linear = MaskedLinear if prune_mask else nn.Linear
+        self.classifier = linear(config.hidden_size, 1)
 
         self.init_weights()
 
@@ -1023,13 +1044,14 @@ class BertForTokenClassification(BertPreTrainedModel):
         loss, scores = outputs[:2]
 
     """
-    def __init__(self, config):
-        super(BertForTokenClassification, self).__init__(config)
+    def __init__(self, config, prune_mask=False):
+        super(BertForTokenClassification, self).__init__(config, prune_mask)
         self.num_labels = config.num_labels
 
-        self.bert = BertModel(config)
+        self.bert = BertModel(config, prune_mask)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        linear = MaskedLinear if prune_mask else nn.Linear
+        self.classifier = linear(config.hidden_size, config.num_labels)
 
         self.init_weights()
 
@@ -1107,12 +1129,13 @@ class BertForQuestionAnswering(BertPreTrainedModel):
 
 
     """
-    def __init__(self, config):
-        super(BertForQuestionAnswering, self).__init__(config)
+    def __init__(self, config, prune_mask=False):
+        super(BertForQuestionAnswering, self).__init__(config, prune_mask)
         self.num_labels = config.num_labels
 
         self.bert = BertModel(config)
-        self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
+        linear = MaskedLinear if prune_mask else nn.Linear
+        self.qa_outputs = linear(config.hidden_size, config.num_labels)
 
         self.init_weights()
 
