@@ -31,7 +31,7 @@ from torch.nn import CrossEntropyLoss, MSELoss
 from .modeling_utils import PreTrainedModel, prune_linear_layer
 from .configuration_bert import BertConfig
 from .file_utils import add_start_docstrings
-from .net.prune import PruningModule, MaskedLinear
+from .net.prune import PruningModule, MaskedLinear, MaskedEmbedding
 
 logger = logging.getLogger(__name__)
 
@@ -146,11 +146,12 @@ BertLayerNorm = torch.nn.LayerNorm
 class BertEmbeddings(PruningModule):
     """Construct the embeddings from word, position and token_type embeddings.
     """
-    def __init__(self, config):
+    def __init__(self, config, prune_mask=False):
         super(BertEmbeddings, self).__init__()
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=0)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+        embedding = MaskedEmbedding if prune_mask else nn.Embedding
+        self.word_embeddings = embedding(config.vocab_size, config.hidden_size, padding_idx=0)
+        self.position_embeddings = embedding(config.max_position_embeddings, config.hidden_size)
+        self.token_type_embeddings = embedding(config.type_vocab_size, config.hidden_size)
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
@@ -582,7 +583,7 @@ class BertModel(BertPreTrainedModel):
     def __init__(self, config, prune_mask=False):
         super(BertModel, self).__init__(config, prune_mask)
 
-        self.embeddings = BertEmbeddings(config)
+        self.embeddings = BertEmbeddings(config, prune_mask)
         self.encoder = BertEncoder(config, prune_mask)
         self.pooler = BertPooler(config, prune_mask)
 
@@ -1133,7 +1134,7 @@ class BertForQuestionAnswering(BertPreTrainedModel):
         super(BertForQuestionAnswering, self).__init__(config, prune_mask)
         self.num_labels = config.num_labels
 
-        self.bert = BertModel(config)
+        self.bert = BertModel(config, prune_mask)
         linear = MaskedLinear if prune_mask else nn.Linear
         self.qa_outputs = linear(config.hidden_size, config.num_labels)
 
