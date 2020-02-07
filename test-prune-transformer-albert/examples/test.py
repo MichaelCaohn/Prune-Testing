@@ -24,7 +24,7 @@ import csv
 maxInt = 200000
 csv.field_size_limit(maxInt)
 import util
-
+import time
 import argparse
 import glob
 import logging
@@ -550,9 +550,10 @@ def main():
     # Training
     if args.do_train:
         train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+        start_time = time.time()
         global_step, tr_loss = train(args, train_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
-
+        elapsed_time = time.time() - start_time
     # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
     if args.do_train and (args.local_rank == -1 or torch.distributed.get_rank() == 0) and not args.tpu:
         # Create output directory if needed
@@ -610,11 +611,16 @@ def main():
         # Retrain
         print("--- Retraining ---")
         train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+        prune_start_time = time.time()
         global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+        prune_elapsed_time = time.time() - prune_start_time
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
         save_path = args.output_dir+"/model_after_retraining.ptmodel"
         torch.save(model, save_path)
         accuracy = evaluate(args, model, tokenizer, prefix=prefix)
+        print("Total time used for training pruned network: {}min".format(prune_elapsed_time/60))
+        print("---------------------------------------------")
+        print("Total time used for training original network: {}min".format(elapsed_time/60))
         util.log(args.log, f"accuracy_after_retraining {accuracy}")
 
         print("--- After Retraining ---")

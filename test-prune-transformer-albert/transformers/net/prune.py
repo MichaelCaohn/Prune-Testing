@@ -46,7 +46,7 @@ class PruningModule(Module):
         I tried multiple values and empirically, 0.25 matches the paper's compression rate and number of parameters.
         Note : In the paper, the authors used different sensitivity values for different layers.
         """
-        # did not include dropout layer, activation layer "word_embeddings", "position_embeddings", "token_type_embeddings", "LayerNorm"
+        # did not include dropout layer, activation layer, "LayerNorm"
         target = ["query", "key", "value", "dense", "classifier", "word_embeddings", "position_embeddings", "token_type_embeddings"]
         for name, module in self.named_modules():
             if any(key in name for key in target):
@@ -54,6 +54,11 @@ class PruningModule(Module):
                 print(f'Pruning with threshold : {threshold} for layer {name}')
                 # print(module)
                 module.prune(threshold)
+                # module.weight_prune(weight_threshold)
+                # if module.bias is not None:
+                #     bias_threshold = np.std(module.bias.data.cpu().numpy()) * s
+                #     print(f'Pruning the bias with threshold : {bias_threshold} for layer {name}')
+                #     module.bias_prune(bias_threshold)
 
 
 class MaskedLinear(Module):
@@ -86,6 +91,7 @@ class MaskedLinear(Module):
         self.weight = Parameter(torch.Tensor(out_features, in_features))
         # Initialize the mask with 1
         self.mask = Parameter(torch.ones([out_features, in_features]), requires_grad=False)
+        # self.bias_mask = Parameter(torch.ones(out_features), requires_grad=False)
         if bias:
             self.bias = Parameter(torch.Tensor(out_features))
         else:
@@ -117,6 +123,17 @@ class MaskedLinear(Module):
         # Apply new weight and mask
         self.weight.data = torch.from_numpy(tensor * new_mask).to(weight_dev)
         self.mask.data = torch.from_numpy(new_mask).to(mask_dev)
+
+    # def bias_prune(self, threshold):
+    #     bias_dev = self.bias.device
+    #     bias_mask_dev = self.bias_mask.device
+    #     # Convert Tensors to numpy and calculate
+    #     tensor = self.bias.data.cpu().numpy()
+    #     bias_mask = self.bias_mask.data.cpu().numpy()
+    #     new_bias_mask = np.where(abs(tensor) < threshold, 0, bias_mask)
+    #     # Apply new weight and mask
+    #     self.bias.data = torch.from_numpy(tensor * new_bias_mask).to(bias_dev)
+    #     self.bias_mask.data = torch.from_numpy(new_bias_mask).to(weight_bias_dev)
 
 class MaskedEmbedding(Module):
     r"""A simple lookup table that stores embeddings of a fixed dictionary and size.
@@ -191,7 +208,7 @@ class MaskedEmbedding(Module):
 
     def __init__(self, num_embeddings, embedding_dim, padding_idx=None,
                  max_norm=None, norm_type=2., scale_grad_by_freq=False,
-                 sparse=False, _weight=None):
+                 sparse=False, _weight=None, bias=False):
         super(MaskedEmbedding, self).__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
@@ -212,6 +229,10 @@ class MaskedEmbedding(Module):
             assert list(_weight.shape) == [num_embeddings, embedding_dim], \
                 'Shape of weight does not match num_embeddings and embedding_dim'
             self.weight = Parameter(_weight)
+        if bias:
+            self.bias = Parameter(torch.Tensor(embedding_dim))
+        else:
+            self.register_parameter('bias', None)
         # Initialize the mask with 1
         self.mask = Parameter(torch.ones([num_embeddings, embedding_dim]), requires_grad=False)
         self.sparse = sparse
