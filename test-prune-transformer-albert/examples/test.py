@@ -92,7 +92,7 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def train(args, train_dataset, model, tokenizer):
+def train(args, train_dataset, model, tokenizer, prune=False):
     """ Train the model """
     # tot = 0
     # for layers in model.children():
@@ -110,6 +110,9 @@ def train(args, train_dataset, model, tokenizer):
     # for n, p in model.named_parameters():
     #     if p.require_grad == False:
     #         no_grad.append(n)
+    if prune and args.different_lr:
+        args.learning_rate = 3e-5
+        args.num_train_epochs = 4.0
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
 
@@ -404,6 +407,8 @@ def main():
                         help="Whether to prune the weights of the network")
     parser.add_argument('--sensitivity', type=float, default=0.25,
                         help="sensitivity value that is multiplied to layer's std in order to get threshold value")
+    parser.add_argument('--different_lr', type=bool, default=False,
+                        help="Whether to use different lr for pruned training and training")
 
     parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for training.")
@@ -597,7 +602,7 @@ def main():
             results.update(result)
 
     #weight pruning:
-    print(model)
+    # print(model)
     if args.prune_weight:
         # Pruning
         args.doing_prune = True
@@ -607,17 +612,27 @@ def main():
         util.log(args.log, f"accuracy_after_pruning {accuracy}")
         print("--- After pruning ---")
         util.print_nonzeros(model)
+        model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
+        pruned_path = os.path.join(args.output_dir, "weight_pruned_network")
+        if not os.path.exists(pruned_path):
+            os.makedirs(pruned_path)
+        model_to_save.save_pretrained(pruned_path)
+        logger.info("Saving model checkpoint to %s", pruned_path)
 
         # Retrain
         print("--- Retraining ---")
         train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+        pruned_model = model_class.from_pretrained(pruned_path, prune_mask=prune_mask)
+        pruned_model.to(args.device)
         prune_start_time = time.time()
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+        global_step, tr_loss = train(args, train_dataset, pruned_model, tokenizer, prune=True)
         prune_elapsed_time = time.time() - prune_start_time
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
         save_path = args.output_dir+"/model_after_retraining.ptmodel"
-        torch.save(model, save_path)
-        accuracy = evaluate(args, model, tokenizer, prefix=prefix)
+        torch.save(pruned_model, save_path)
+
+        # Retest the accuracy
+        accuracy = evaluate(args, pruned_model, tokenizer, prefix=prefix)
         print("Total time used for training pruned network: {}min".format(prune_elapsed_time/60))
         print("---------------------------------------------")
         print("Total time used for training original network: {}min".format(elapsed_time/60))

@@ -19,6 +19,7 @@ from __future__ import absolute_import, division, print_function
 
 import sys
 sys.path.append("..")
+from os import listdir
 
 import csv
 maxInt = 200000
@@ -311,6 +312,72 @@ def evaluate(args, model, tokenizer, prefix=""):
     return results
 
 
+def ensemble(args, model, tokenizer, prefix=""):
+    # Loop to handle MNLI double evaluation (matched, mis-matched)
+    eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
+    eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM') if args.task_name == "mnli" else (args.output_dir,)
+
+    results = {}
+    for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
+        eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
+
+        if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
+            os.makedirs(eval_output_dir)
+
+        args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
+        # Note that DistributedSampler samples randomly
+        eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
+        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+
+        # Eval!
+        logger.info("***** Running ensemble parts {} *****".format(prefix))
+        logger.info("  Num examples = %d", len(eval_dataset))
+        logger.info("  Batch size = %d", args.eval_batch_size)
+        eval_loss = 0.0
+        nb_eval_steps = 0
+        preds = None
+        out_label_ids = None
+        for batch in tqdm(eval_dataloader, desc="Evaluating"):
+            model.eval()
+            batch = tuple(t.to(args.device) for t in batch)
+
+            with torch.no_grad():
+                inputs = {'input_ids': batch[0],
+                          'attention_mask': batch[1],
+                          'labels': batch[3]}
+                if args.model_type != 'distilbert':
+                    inputs['token_type_ids'] = batch[2] if args.model_type in ['bert',
+                                                                               'xlnet'] else None  # XLM, DistilBERT and RoBERTa don't use segment_ids
+                outputs = model(**inputs)
+                tmp_eval_loss, logits = outputs[:2]
+
+                eval_loss += tmp_eval_loss.mean().item()
+            nb_eval_steps += 1
+            if preds is None:
+                preds = logits.detach().cpu().numpy()
+                out_label_ids = inputs['labels'].detach().cpu().numpy()
+            else:
+                preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
+                out_label_ids = np.append(out_label_ids, inputs['labels'].detach().cpu().numpy(), axis=0)
+
+        # eval_loss = eval_loss / nb_eval_steps
+        # if args.output_mode == "classification":
+        #     preds = np.argmax(preds, axis=1)
+        # elif args.output_mode == "regression":
+        #     preds = np.squeeze(preds)
+        # result = compute_metrics(eval_task, preds, out_label_ids)
+        # results.update(result)
+
+        # output_eval_file = os.path.join(eval_output_dir, prefix, "eval_results.txt")
+        # with open(output_eval_file, "w") as writer:
+        #     logger.info("***** Eval results {} *****".format(prefix))
+        #     for key in sorted(result.keys()):
+        #         logger.info("  %s = %s", key, str(result[key]))
+        #         writer.write("%s = %s\n" % (key, str(result[key])))
+
+    return eval_task, preds, out_label_ids
+
+
 def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
@@ -404,6 +471,12 @@ def main():
                         help="Whether to prune the weights of the network")
     parser.add_argument('--sensitivity', type=float, default=0.25,
                         help="sensitivity value that is multiplied to layer's std in order to get threshold value")
+    parser.add_argument("--ensemble", type=bool, default=True,
+                        help="Whether to perform ensemble or not")
+    parser.add_argument('--ensemble_members', type=str, default=None, required=True,
+                        help="The locations for different modules")
+    # parser.add_argument('--position_of_bert_uncased', type=str, default=None, require=True,
+    #                     help="The position in the list of locations for ensemble members, counting from 1, 0 indicate no large used")
 
     parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for training.")
@@ -463,179 +536,516 @@ def main():
     parser.add_argument('--log', type=str, default='log.txt', help='log file name')
     args = parser.parse_args()
     prune_mask = args.prune_weight
-    args.do_train = True
-    args.do_eval = True
-    args.do_lower_case = True
-    if os.path.exists(args.output_dir) and os.listdir(
-            args.output_dir) and args.do_train and not args.overwrite_output_dir:
-        raise ValueError(
-            "Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(
-                args.output_dir))
+    if args.ensemble:
+        ## observe: large is better than base; and uncased is better than cased; the difference between the first two is greater
+        args.do_train = True
+        args.do_eval = True
+        args.do_lower_case = True
+        # Setup distant debugging if needed
+        if args.server_ip and args.server_port:
+            # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
+            import ptvsd
+            print("Waiting for debugger attach")
+            ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
+            ptvsd.wait_for_attach()
 
-    # Setup distant debugging if needed
-    if args.server_ip and args.server_port:
-        # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
-        import ptvsd
-        print("Waiting for debugger attach")
-        ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
-        ptvsd.wait_for_attach()
+        # Setup CUDA, GPU & distributed training
+        if args.local_rank == -1 or args.no_cuda:
+            device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+            args.n_gpu = torch.cuda.device_count()
+        else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+            torch.cuda.set_device(args.local_rank)
+            device = torch.device("cuda", args.local_rank)
+            torch.distributed.init_process_group(backend='nccl')
+            args.n_gpu = 1
+        args.device = device
 
-    # Setup CUDA, GPU & distributed training
-    if args.local_rank == -1 or args.no_cuda:
-        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-        args.n_gpu = torch.cuda.device_count()
-    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
-        torch.distributed.init_process_group(backend='nccl')
-        args.n_gpu = 1
-    args.device = device
+        if args.tpu:
+            if args.tpu_ip_address:
+                os.environ["TPU_IP_ADDRESS"] = args.tpu_ip_address
+            if args.tpu_name:
+                os.environ["TPU_NAME"] = args.tpu_name
+            if args.xrt_tpu_config:
+                os.environ["XRT_TPU_CONFIG"] = args.xrt_tpu_config
 
-    if args.tpu:
-        if args.tpu_ip_address:
-            os.environ["TPU_IP_ADDRESS"] = args.tpu_ip_address
-        if args.tpu_name:
-            os.environ["TPU_NAME"] = args.tpu_name
-        if args.xrt_tpu_config:
-            os.environ["XRT_TPU_CONFIG"] = args.xrt_tpu_config
+            assert "TPU_IP_ADDRESS" in os.environ
+            assert "TPU_NAME" in os.environ
+            assert "XRT_TPU_CONFIG" in os.environ
 
-        assert "TPU_IP_ADDRESS" in os.environ
-        assert "TPU_NAME" in os.environ
-        assert "XRT_TPU_CONFIG" in os.environ
+            import torch_xla
+            import torch_xla.core.xla_model as xm
+            args.device = xm.xla_device()
+            args.xla_model = xm
 
-        import torch_xla
-        import torch_xla.core.xla_model as xm
-        args.device = xm.xla_device()
-        args.xla_model = xm
+        # Setup logging
+        logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                            datefmt='%m/%d/%Y %H:%M:%S',
+                            level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+        logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
+                       args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
 
-    # Setup logging
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                        datefmt='%m/%d/%Y %H:%M:%S',
-                        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
-    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
-                   args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
+        # Set seed
+        set_seed(args)
 
-    # Set seed
-    set_seed(args)
+        # Prepare GLUE task
+        args.task_name = args.task_name.lower()
+        if args.task_name not in processors:
+            raise ValueError("Task not found: %s" % (args.task_name))
+        processor = processors[args.task_name]()
+        args.output_mode = output_modes[args.task_name]
+        label_list = processor.get_labels()
+        num_labels = len(label_list)
 
-    # Prepare GLUE task
-    args.task_name = args.task_name.lower()
-    if args.task_name not in processors:
-        raise ValueError("Task not found: %s" % (args.task_name))
-    processor = processors[args.task_name]()
-    args.output_mode = output_modes[args.task_name]
-    label_list = processor.get_labels()
-    num_labels = len(label_list)
+        # Load pretrained model and tokenizer
+        if args.local_rank not in [-1, 0]:
+            torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
-    # Load pretrained model and tokenizer
-    if args.local_rank not in [-1, 0]:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+        args.model_type = args.model_type.lower()
+        config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+        config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path,
+                                              num_labels=num_labels, finetuning_task=args.task_name)
+        tokenizer_cased = tokenizer_class.from_pretrained(
+            "bert-base-cased",
+            do_lower_case=args.do_lower_case)
+        tokenizer_uncased = tokenizer_class.from_pretrained(
+            "bert-base-uncased",
+            do_lower_case=args.do_lower_case)
+        # model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path),
+        #                                     config=config, prune_mask=prune_mask)
 
-    args.model_type = args.model_type.lower()
-    config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path,
-                                          num_labels=num_labels, finetuning_task=args.task_name)
-    tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
-                                                do_lower_case=args.do_lower_case)
-    model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path),
-                                        config=config, prune_mask=prune_mask)
+        if args.local_rank == 0:
+            torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+        logger.info("Training/evaluation parameters %s", args)
 
-    if args.local_rank == 0:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
-    model.to(args.device)
+        path_list = ["bert-large-cased", "bert-base-cased", "bert-base-cased_epoch_4_lr_3",
+                     "bert-base-cased_epoch_5_lr_2", "bert-base-uncased",
+                     "bert-base-uncased_epoch_4_lr_3", "bert-base-uncased_epoch_5_lr_2",
+                     "bert-base-uncased_epoch_6_lr_2", "bert-base-uncased_epoch_7_lr_2",
+                     "bert-base-uncased_epoch_8_lr_2", "bert-base-uncased_epoch_6_lr_2_se_2",
+                     "bert-base-uncased_epoch_6_lr_2_prune_diff", "bert-large-uncased",
+                     "bert-large-uncased-epoch-4", "bert-large-uncased_epoch_3_lr_3",
+                     "bert-large-uncased_epoch_4_lr_4", "bert-large-uncased_epoch_4_lr_2",
+                     "bert-large-uncased_epoch_5_lr_2", "bert-large-uncased_epoch_6_lr_2",
+                     "bert-large-uncased_epoch_5_lr_3", "bert-large-uncased_epoch_7_lr_2",
+                     "bert-large-uncased_epoch_7_lr_2_diff_lr"]
+        num_list = args.ensemble_members.split('+')
+        print(num_list)
+        final_pred = 0
+        model_list = [1]
+        model_list[0] = path_list[int(num_list[0]) - 1]
+        for i in range(1, len(num_list)):
+            print(num_list[i])
+            model_list.append(path_list[int(num_list[i]) - 1])
+        tot = len(model_list)
+        cnt_base = 0
+        cnt_large = 0
+        print(model_list)
+        for j in model_list:
+            if 'uncased' in j:
+                if 'base' in j:
+                    cnt_base += 1
+                else:
+                    cnt_large += 1
+        cnt_case = tot - cnt_base - cnt_large
+        case_weight = 1
+        if cnt_case == 0:
+            base_uncased_weight = 1
+        else:
+            base_uncased_weight = cnt_case
+        large_uncased_weight = base_uncased_weight + 0.5
+        print("Number of case model: {}".format(cnt_case))
+        print("Number of base-uncase model: {}".format(cnt_base))
+        print("Number of large-uncase model: {}".format(cnt_large))
+        for i in range(len(model_list)):
+            pre_path = os.path.join(model_list[i], "model_after_retraining.ptmodel")
+            before_path = os.path.join("/work/xuweinan/MNIST/google-research/test_prune_embeddings/examples", args.task_name)
+            path = os.path.join(before_path, pre_path)
+            modul = torch.load(path)
+            # eval_task, pred, out_label_ids = ensemble(args, modul, tokenizer)
+            # final_pred = pred
+            # pred_label = np.argmax(final_pred, axis=1)
+            # result = compute_metrics(eval_task, pred_label, out_label_ids)
+            # print("final accuracy: {}".format(result))
 
-    logger.info("Training/evaluation parameters %s", args)
-
-    # Training
-    if args.do_train:
-        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
-        start_time = time.time()
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
-        logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
-        elapsed_time = time.time() - start_time
-    # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
-    if args.do_train and (args.local_rank == -1 or torch.distributed.get_rank() == 0) and not args.tpu:
-        # Create output directory if needed
-        if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
-            os.makedirs(args.output_dir)
-
-        logger.info("Saving model checkpoint to %s", args.output_dir)
-        # Save a trained model, configuration and tokenizer using `save_pretrained()`.
-        # They can then be reloaded using `from_pretrained()`
-        model_to_save = model.module if hasattr(model,
-                                                'module') else model  # Take care of distributed/parallel training
-        model_to_save.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
-
-        # Good practice: save your training arguments together with the trained model
-        torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
-
-        # Load a trained model and vocabulary that you have fine-tuned
-        model = model_class.from_pretrained(args.output_dir, prune_mask=prune_mask)
-        tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
-        model.to(args.device)
-
-    # Evaluation
-    results = {}
-    if args.do_eval and args.local_rank in [-1, 0]:
-        tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
-        checkpoints = [args.output_dir]
-        if args.eval_all_checkpoints:
-            checkpoints = list(
-                os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
-            logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
-        logger.info("Evaluate the following checkpoints: %s", checkpoints)
-        for checkpoint in checkpoints:
-            global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
-            prefix = checkpoint.split('/')[-1] if checkpoint.find('checkpoint') != -1 else ""
-
-            model = model_class.from_pretrained(checkpoint, prune_mask=prune_mask)
-            model.to(args.device)
-            result = evaluate(args, model, tokenizer, prefix=prefix)
-            result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
-            results.update(result)
-
-    #weight pruning:
-    # print(model)
-    if args.prune_weight:
-        # Pruning
-        args.doing_prune = True
-        model.prune_by_std(args.sensitivity)
-        accuracy = evaluate(args, model, tokenizer, prefix=prefix)
-        print(args.log)
-        util.log(args.log, f"accuracy_after_pruning {accuracy}")
-        print("--- After pruning ---")
-        util.print_nonzeros(model)
-        model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
-        pruned_path = os.path.join(args.output_dir, "weight_pruned_network")
-        if not os.path.exists(pruned_path):
-            os.makedirs(pruned_path)
-        model_to_save.save_pretrained(pruned_path)
-        logger.info("Saving model checkpoint to %s", pruned_path)
-
-        # Retrain
-        print("--- Retraining ---")
-        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
-        pruned_model = model_class.from_pretrained(pruned_path, prune_mask=prune_mask)
-        pruned_model.to(args.device)
-        prune_start_time = time.time()
-        global_step, tr_loss = train(args, train_dataset, pruned_model, tokenizer)
-        prune_elapsed_time = time.time() - prune_start_time
-        logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
-        save_path = args.output_dir+"/model_after_retraining.ptmodel"
-        torch.save(pruned_model, save_path)
-
-        # Retest the accuracy
-        accuracy = evaluate(args, pruned_model, tokenizer, prefix=prefix)
-        print("Total time used for training pruned network: {}min".format(prune_elapsed_time/60))
-        print("---------------------------------------------")
-        print("Total time used for training original network: {}min".format(elapsed_time/60))
-        util.log(args.log, f"accuracy_after_retraining {accuracy}")
-
-        print("--- After Retraining ---")
-        util.print_nonzeros(model)
-    # return results
+            # test_model.to(args.device)
+            if "uncased" in model_list[i]:
+                tokenizer = tokenizer_uncased
+                args.model_name_or_path = "bert-base-uncased"
+            else:
+                tokenizer = tokenizer_cased
+                args.model_name_or_path = "bert-base-cased"
+            eval_task, pred, out_label_ids = ensemble(args, modul, tokenizer)
+            pred_label = np.argmax(pred, axis=1)
+            result = compute_metrics(eval_task, pred_label, out_label_ids)
+            print("Accuracy for member{}: {}".format(model_list[i], result))
+            if 'uncased' in path:
+                if 'base' in path:
+                    weight = base_uncased_weight
+                else:
+                    weight = large_uncased_weight
+            else:
+                weight = case_weight
+            print("Weight for BERT: {} with weight: {}".format(path, weight))
+            if i == 0:
+                final_pred = weight * pred
+            else:
+                final_pred += weight * pred
+            save_path = args.output_dir+"/model_after_retraining.ptmodel"
+            torch.save(modul, save_path)
+        pred_label = np.argmax(final_pred, axis=1)
+        result = compute_metrics(eval_task, pred_label, out_label_ids)
+        print("final accuracy: {}".format(result))
+    # else:
+    #     args.do_train = True
+    #     args.do_eval = True
+    #     args.do_lower_case = True
+    #     if os.path.exists(args.output_dir) and os.listdir(
+    #             args.output_dir) and args.do_train and not args.overwrite_output_dir:
+    #         raise ValueError(
+    #             "Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(
+    #                 args.output_dir))
+    #
+    #     # Setup distant debugging if needed
+    #     if args.server_ip and args.server_port:
+    #         # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
+    #         import ptvsd
+    #         print("Waiting for debugger attach")
+    #         ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
+    #         ptvsd.wait_for_attach()
+    #
+    #     # Setup CUDA, GPU & distributed training
+    #     if args.local_rank == -1 or args.no_cuda:
+    #         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    #         args.n_gpu = torch.cuda.device_count()
+    #     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+    #         torch.cuda.set_device(args.local_rank)
+    #         device = torch.device("cuda", args.local_rank)
+    #         torch.distributed.init_process_group(backend='nccl')
+    #         args.n_gpu = 1
+    #     args.device = device
+    #
+    #     if args.tpu:
+    #         if args.tpu_ip_address:
+    #             os.environ["TPU_IP_ADDRESS"] = args.tpu_ip_address
+    #         if args.tpu_name:
+    #             os.environ["TPU_NAME"] = args.tpu_name
+    #         if args.xrt_tpu_config:
+    #             os.environ["XRT_TPU_CONFIG"] = args.xrt_tpu_config
+    #
+    #         assert "TPU_IP_ADDRESS" in os.environ
+    #         assert "TPU_NAME" in os.environ
+    #         assert "XRT_TPU_CONFIG" in os.environ
+    #
+    #         import torch_xla
+    #         import torch_xla.core.xla_model as xm
+    #         args.device = xm.xla_device()
+    #         args.xla_model = xm
+    #
+    #     # Setup logging
+    #     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+    #                         datefmt='%m/%d/%Y %H:%M:%S',
+    #                         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+    #     logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
+    #                    args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
+    #
+    #     # Set seed
+    #     set_seed(args)
+    #
+    #     # Prepare GLUE task
+    #     args.task_name = args.task_name.lower()
+    #     if args.task_name not in processors:
+    #         raise ValueError("Task not found: %s" % (args.task_name))
+    #     processor = processors[args.task_name]()
+    #     args.output_mode = output_modes[args.task_name]
+    #     label_list = processor.get_labels()
+    #     num_labels = len(label_list)
+    #
+    #     # Load pretrained model and tokenizer
+    #     if args.local_rank not in [-1, 0]:
+    #         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+    #
+    #     args.model_type = args.model_type.lower()
+    #     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    #     config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path,
+    #                                           num_labels=num_labels, finetuning_task=args.task_name)
+    #     tokenizer = tokenizer_class.from_pretrained(
+    #         args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
+    #         do_lower_case=args.do_lower_case)
+    #     model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path),
+    #                                         config=config, prune_mask=prune_mask)
+    #
+    #     if args.local_rank == 0:
+    #         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+    #
+    #     model.to(args.device)
+    #
+    #     logger.info("Training/evaluation parameters %s", args)
+    #
+    #     # Training
+    #     if args.do_train:
+    #         train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+    #         start_time = time.time()
+    #         global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+    #         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
+    #         elapsed_time = time.time() - start_time
+    #     # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
+    #     if args.do_train and (args.local_rank == -1 or torch.distributed.get_rank() == 0) and not args.tpu:
+    #         # Create output directory if needed
+    #         if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
+    #             os.makedirs(args.output_dir)
+    #
+    #         logger.info("Saving model checkpoint to %s", args.output_dir)
+    #         # Save a trained model, configuration and tokenizer using `save_pretrained()`.
+    #         # They can then be reloaded using `from_pretrained()`
+    #         model_to_save = model.module if hasattr(model,
+    #                                                 'module') else model  # Take care of distributed/parallel training
+    #         model_to_save.save_pretrained(args.output_dir)
+    #         tokenizer.save_pretrained(args.output_dir)
+    #
+    #         # Good practice: save your training arguments together with the trained model
+    #         torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
+    #
+    #         # Load a trained model and vocabulary that you have fine-tuned
+    #         model = model_class.from_pretrained(args.output_dir, prune_mask=prune_mask)
+    #         tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
+    #         model.to(args.device)
+    #
+    #     # Evaluation
+    #     results = {}
+    #     if args.do_eval and args.local_rank in [-1, 0]:
+    #         tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
+    #         checkpoints = [args.output_dir]
+    #         if args.eval_all_checkpoints:
+    #             checkpoints = list(
+    #                 os.path.dirname(c) for c in
+    #                 sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
+    #             logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
+    #         logger.info("Evaluate the following checkpoints: %s", checkpoints)
+    #         for checkpoint in checkpoints:
+    #             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
+    #             prefix = checkpoint.split('/')[-1] if checkpoint.find('checkpoint') != -1 else ""
+    #
+    #             model = model_class.from_pretrained(checkpoint, prune_mask=prune_mask)
+    #             model.to(args.device)
+    #             result = evaluate(args, model, tokenizer, prefix=prefix)
+    #             result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
+    #             results.update(result)
+    #
+    #     # weight pruning:
+    #     # print(model)
+    #     if args.prune_weight:
+    #         # Pruning
+    #         args.doing_prune = True
+    #         model.prune_by_std(args.sensitivity)
+    #         accuracy = evaluate(args, model, tokenizer, prefix=prefix)
+    #         print(args.log)
+    #         util.log(args.log, f"accuracy_after_pruning {accuracy}")
+    #         print("--- After pruning ---")
+    #         util.print_nonzeros(model)
+    #         model_to_save = model.module if hasattr(model,
+    #                                                 'module') else model  # Take care of distributed/parallel training
+    #         pruned_path = os.path.join(args.output_dir, "weight_pruned_network")
+    #         if not os.path.exists(pruned_path):
+    #             os.makedirs(pruned_path)
+    #         model_to_save.save_pretrained(pruned_path)
+    #         logger.info("Saving model checkpoint to %s", pruned_path)
+    #
+    #         # Retrain
+    #         print("--- Retraining ---")
+    #         train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+    #         pruned_model = model_class.from_pretrained(pruned_path, prune_mask=prune_mask)
+    #         pruned_model.to(args.device)
+    #         prune_start_time = time.time()
+    #         global_step, tr_loss = train(args, train_dataset, pruned_model, tokenizer)
+    #         prune_elapsed_time = time.time() - prune_start_time
+    #         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
+    #         save_path = args.output_dir + "/model_after_retraining.ptmodel"
+    #         torch.save(pruned_model, save_path)
+    #
+    #         # Retest the accuracy
+    #         accuracy = evaluate(args, pruned_model, tokenizer, prefix=prefix)
+    #         print("Total time used for training pruned network: {}min".format(prune_elapsed_time / 60))
+    #         print("---------------------------------------------")
+    #         print("Total time used for training original network: {}min".format(elapsed_time / 60))
+    #         util.log(args.log, f"accuracy_after_retraining {accuracy}")
+    #
+    #         print("--- After Retraining ---")
+    #         util.print_nonzeros(model)
+        # return results
+    # args.do_train = True
+    # args.do_eval = True
+    # args.do_lower_case = True
+    # if os.path.exists(args.output_dir) and os.listdir(
+    #         args.output_dir) and args.do_train and not args.overwrite_output_dir:
+    #     raise ValueError(
+    #         "Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(
+    #             args.output_dir))
+    #
+    # # Setup distant debugging if needed
+    # if args.server_ip and args.server_port:
+    #     # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
+    #     import ptvsd
+    #     print("Waiting for debugger attach")
+    #     ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
+    #     ptvsd.wait_for_attach()
+    #
+    # # Setup CUDA, GPU & distributed training
+    # if args.local_rank == -1 or args.no_cuda:
+    #     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    #     args.n_gpu = torch.cuda.device_count()
+    # else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+    #     torch.cuda.set_device(args.local_rank)
+    #     device = torch.device("cuda", args.local_rank)
+    #     torch.distributed.init_process_group(backend='nccl')
+    #     args.n_gpu = 1
+    # args.device = device
+    #
+    # if args.tpu:
+    #     if args.tpu_ip_address:
+    #         os.environ["TPU_IP_ADDRESS"] = args.tpu_ip_address
+    #     if args.tpu_name:
+    #         os.environ["TPU_NAME"] = args.tpu_name
+    #     if args.xrt_tpu_config:
+    #         os.environ["XRT_TPU_CONFIG"] = args.xrt_tpu_config
+    #
+    #     assert "TPU_IP_ADDRESS" in os.environ
+    #     assert "TPU_NAME" in os.environ
+    #     assert "XRT_TPU_CONFIG" in os.environ
+    #
+    #     import torch_xla
+    #     import torch_xla.core.xla_model as xm
+    #     args.device = xm.xla_device()
+    #     args.xla_model = xm
+    #
+    # # Setup logging
+    # logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+    #                     datefmt='%m/%d/%Y %H:%M:%S',
+    #                     level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+    # logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
+    #                args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
+    #
+    # # Set seed
+    # set_seed(args)
+    #
+    # # Prepare GLUE task
+    # args.task_name = args.task_name.lower()
+    # if args.task_name not in processors:
+    #     raise ValueError("Task not found: %s" % (args.task_name))
+    # processor = processors[args.task_name]()
+    # args.output_mode = output_modes[args.task_name]
+    # label_list = processor.get_labels()
+    # num_labels = len(label_list)
+    #
+    # # Load pretrained model and tokenizer
+    # if args.local_rank not in [-1, 0]:
+    #     torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+    #
+    # args.model_type = args.model_type.lower()
+    # config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    # config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path,
+    #                                       num_labels=num_labels, finetuning_task=args.task_name)
+    # tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
+    #                                             do_lower_case=args.do_lower_case)
+    # model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path),
+    #                                     config=config, prune_mask=prune_mask)
+    #
+    # if args.local_rank == 0:
+    #     torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+    #
+    # model.to(args.device)
+    #
+    # logger.info("Training/evaluation parameters %s", args)
+    #
+    # # Training
+    # if args.do_train:
+    #     train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+    #     start_time = time.time()
+    #     global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+    #     logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
+    #     elapsed_time = time.time() - start_time
+    # # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
+    # if args.do_train and (args.local_rank == -1 or torch.distributed.get_rank() == 0) and not args.tpu:
+    #     # Create output directory if needed
+    #     if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
+    #         os.makedirs(args.output_dir)
+    #
+    #     logger.info("Saving model checkpoint to %s", args.output_dir)
+    #     # Save a trained model, configuration and tokenizer using `save_pretrained()`.
+    #     # They can then be reloaded using `from_pretrained()`
+    #     model_to_save = model.module if hasattr(model,
+    #                                             'module') else model  # Take care of distributed/parallel training
+    #     model_to_save.save_pretrained(args.output_dir)
+    #     tokenizer.save_pretrained(args.output_dir)
+    #
+    #     # Good practice: save your training arguments together with the trained model
+    #     torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
+    #
+    #     # Load a trained model and vocabulary that you have fine-tuned
+    #     model = model_class.from_pretrained(args.output_dir, prune_mask=prune_mask)
+    #     tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
+    #     model.to(args.device)
+    #
+    # # Evaluation
+    # results = {}
+    # if args.do_eval and args.local_rank in [-1, 0]:
+    #     tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
+    #     checkpoints = [args.output_dir]
+    #     if args.eval_all_checkpoints:
+    #         checkpoints = list(
+    #             os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
+    #         logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
+    #     logger.info("Evaluate the following checkpoints: %s", checkpoints)
+    #     for checkpoint in checkpoints:
+    #         global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
+    #         prefix = checkpoint.split('/')[-1] if checkpoint.find('checkpoint') != -1 else ""
+    #
+    #         model = model_class.from_pretrained(checkpoint, prune_mask=prune_mask)
+    #         model.to(args.device)
+    #         result = evaluate(args, model, tokenizer, prefix=prefix)
+    #         result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
+    #         results.update(result)
+    #
+    # #weight pruning:
+    # # print(model)
+    # if args.prune_weight:
+    #     # Pruning
+    #     args.doing_prune = True
+    #     model.prune_by_std(args.sensitivity)
+    #     accuracy = evaluate(args, model, tokenizer, prefix=prefix)
+    #     print(args.log)
+    #     util.log(args.log, f"accuracy_after_pruning {accuracy}")
+    #     print("--- After pruning ---")
+    #     util.print_nonzeros(model)
+    #     model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
+    #     pruned_path = os.path.join(args.output_dir, "weight_pruned_network")
+    #     if not os.path.exists(pruned_path):
+    #         os.makedirs(pruned_path)
+    #     model_to_save.save_pretrained(pruned_path)
+    #     logger.info("Saving model checkpoint to %s", pruned_path)
+    #
+    #     # Retrain
+    #     print("--- Retraining ---")
+    #     train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+    #     pruned_model = model_class.from_pretrained(pruned_path, prune_mask=prune_mask)
+    #     pruned_model.to(args.device)
+    #     prune_start_time = time.time()
+    #     global_step, tr_loss = train(args, train_dataset, pruned_model, tokenizer)
+    #     prune_elapsed_time = time.time() - prune_start_time
+    #     logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
+    #     save_path = args.output_dir+"/model_after_retraining.ptmodel"
+    #     torch.save(pruned_model, save_path)
+    #
+    #     # Retest the accuracy
+    #     accuracy = evaluate(args, pruned_model, tokenizer, prefix=prefix)
+    #     print("Total time used for training pruned network: {}min".format(prune_elapsed_time/60))
+    #     print("---------------------------------------------")
+    #     print("Total time used for training original network: {}min".format(elapsed_time/60))
+    #     util.log(args.log, f"accuracy_after_retraining {accuracy}")
+    #
+    #     print("--- After Retraining ---")
+    #     util.print_nonzeros(model)
+    # # return results
 
 if __name__ == "__main__":
     main()
