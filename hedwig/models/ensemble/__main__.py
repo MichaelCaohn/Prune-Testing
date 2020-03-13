@@ -3,7 +3,7 @@ import time
 
 import numpy as np
 import torch
-import models.bert.util as utils
+import models.bert.util as util
 from transformers import AdamW, BertForSequenceClassification, BertTokenizer, WarmupLinearSchedule
 
 from common.constants import *
@@ -36,7 +36,7 @@ if __name__ == '__main__':
     print("Data set: {}".format(args.dataset))
     print("Learning hyperparamters: lr:{}".format(args.lr))
     print("Learning hyperparamters: ep:{}".format(args.epochs))
-    
+
     print('Device:', str(device).upper())
     print('Number of GPUs:', n_gpu)
     print('FP16:', args.fp16)
@@ -60,7 +60,7 @@ if __name__ == '__main__':
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
-                            args.gradient_accumulation_steps))
+            args.gradient_accumulation_steps))
 
     if args.dataset not in dataset_map:
         raise ValueError('Unrecognized dataset')
@@ -88,10 +88,23 @@ if __name__ == '__main__':
         num_train_optimization_steps = int(
             len(train_examples) / args.batch_size / args.gradient_accumulation_steps) * args.epochs
 
-    # pretrained_model_path = args.model if os.path.isfile(args.model) else PRETRAINED_MODEL_ARCHIVE_MAP[args.model]
-    pretrained_model_path = args.model
-    model = BertForSequenceClassification.from_pretrained(pretrained_model_path, num_labels=args.num_labels, prune_mask=args.prune_weight)
 
+    pretrained_model_path = os.path.join(save_path, "model_weight.pth")
+    model = BertForSequenceClassification.from_pretrained(args.model, num_labels=args.num_labels,
+                                                          prune_mask=args.prune_weight)
+    model_ = torch.load(pretrained_model_path, map_location=lambda storage, loc: storage)
+    state = {}
+    for key in model_.state_dict().keys():
+        new_key = key.replace("module.", "")
+        state[new_key] = model_.state_dict()[key]
+    model.load_state_dict(state)
+    model = model.to(device)
+
+    evaluate_split(model, processor, tokenizer, args, split='dev')
+    evaluate_split(model, processor, tokenizer, args, split='test')
+    model.prune_by_std(args.sensitivity)
+    print("--- After pruning ---")
+    util.print_nonzeros(model)
     if args.fp16:
         model.half()
     model.to(device)
@@ -127,24 +140,13 @@ if __name__ == '__main__':
         scheduler = WarmupLinearSchedule(optimizer, t_total=num_train_optimization_steps,
                                          warmup_steps=args.warmup_proportion * num_train_optimization_steps)
 
-    trainer = BertTrainer(model, optimizer, processor, scheduler, tokenizer, args, False, save_path)
-
-    if not args.trained_model:
-        start_time = time.time()
-        trainer.train()
-        model = torch.load(trainer.snapshot_path)
-        elapsed_time = time.time() - start_time
-
-    else:
-        model = BertForSequenceClassification.from_pretrained(pretrained_model_path, num_labels=args.num_labels, prune_mask=args.prune_weight)
-        model_ = torch.load(args.trained_model, map_location=lambda storage, loc: storage)
-        state = {}
-        for key in model_.state_dict().keys():
-            new_key = key.replace("module.", "")
-            state[new_key] = model_.state_dict()[key]
-        model.load_state_dict(state)
-        model = model.to(device)
-
+    print("--- Retraining ---")
+    trainer = BertTrainer(model, optimizer, processor, scheduler, tokenizer, args, True, save_path)
+    prune_start_time = time.time()
+    trainer.train()
+    prune_elapsed_time = time.time() - prune_start_time
+    pruned_model = torch.load(trainer.snapshot_path)
+    print("--- After Retraining ---")
     evaluate_split(model, processor, tokenizer, args, split='dev')
     evaluate_split(model, processor, tokenizer, args, split='test')
-    print("Total training time: {}".format(elapsed_time/60))
+    print("Total training time: {}".format(prune_elapsed_time / 60))
