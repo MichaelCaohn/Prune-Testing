@@ -10,10 +10,12 @@ def get_args():
     parser.add_argument('--dataset', type=str, default='SST-2', choices=['SST-2', 'AGNews', 'Reuters', 'AAPD', 'IMDB', 'Yelp2014'])
     parser.add_argument('--save_path', type=str, default=os.path.join('model_checkpoints', 'bert'))
     parser.add_argument('--cache-dir', default='cache', type=str)
-    parser.add_argument('--trained-model', default=None, type=str)
+    parser.add_argument('--trained_model', default=None, type=str)
     parser.add_argument('--fp16', action='store_true', help='use 16-bit floating point precision')
     parser.add_argument('--prune_weight', type=bool, default=False, help='use 16-bit floating point precision')
-    parser.add_argument('--sensitivity', type=float, default=0.25,
+    parser.add_argument('--ensemble_members', type=str, default=None,
+                        help="The locations for different modules")
+    parser.add_argument('--sensitivity', type=float, default=0.25, 
                         help="sensitivity value that is multiplied to layer's std in order to get threshold value")
     parser.add_argument('--max-seq-length',
                         default=128,

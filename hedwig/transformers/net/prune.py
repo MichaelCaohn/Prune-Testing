@@ -106,6 +106,7 @@ class MaskedLinear(Module):
 
     def forward(self, input):
         return F.linear(input, self.weight * self.mask, self.bias)
+        # return F.linear(input, self.weight, self.bias)
 
     def __repr__(self):
         return self.__class__.__name__ + '(' \
@@ -123,6 +124,7 @@ class MaskedLinear(Module):
         # Apply new weight and mask
         self.weight.data = torch.from_numpy(tensor * new_mask).to(weight_dev)
         self.mask.data = torch.from_numpy(new_mask).to(mask_dev)
+        self.mask.requires_grad = False
 
     # def bias_prune(self, threshold):
     #     bias_dev = self.bias.device
@@ -247,6 +249,9 @@ class MaskedEmbedding(Module):
         return F.embedding(
             input, self.weight * self.mask, self.padding_idx, self.max_norm,
             self.norm_type, self.scale_grad_by_freq, self.sparse)
+        # return F.embedding(
+        #     input, self.weight, self.padding_idx, self.max_norm,
+        #     self.norm_type, self.scale_grad_by_freq, self.sparse)
 
     def extra_repr(self):
         s = '{num_embeddings}, {embedding_dim}'
@@ -272,6 +277,7 @@ class MaskedEmbedding(Module):
         # Apply new weight and mask
         self.weight.data = torch.from_numpy(tensor * new_mask).to(weight_dev)
         self.mask.data = torch.from_numpy(new_mask).to(mask_dev)
+        self.mask.requires_grad = False
 
     @classmethod
     def from_pretrained(cls, embeddings, freeze=True, padding_idx=None,
