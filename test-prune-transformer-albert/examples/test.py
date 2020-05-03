@@ -113,6 +113,8 @@ def train(args, train_dataset, model, tokenizer, prune=False):
     if prune and args.different_lr:
         args.learning_rate = 3e-5
         args.num_train_epochs = 4.0
+    if prune and args.diff_epoch != 0.0:
+        args.num_train_epochs = args.diff_epoch
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
 
@@ -409,6 +411,8 @@ def main():
                         help="sensitivity value that is multiplied to layer's std in order to get threshold value")
     parser.add_argument('--different_lr', type=bool, default=False,
                         help="Whether to use different lr for pruned training and training")
+    parser.add_argument('--diff_epoch', type=float, default=0.0,
+                        help="Whether to use different lr for pruned training and training")
 
     parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for training.")
@@ -589,8 +593,8 @@ def main():
         if args.eval_all_checkpoints:
             checkpoints = list(
                 os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
-            logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
-        logger.info("Evaluate the following checkpoints: %s", checkpoints)
+            # logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
+        # logger.info("Evaluate the following checkpoints: %s", checkpoints)
         for checkpoint in checkpoints:
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
             prefix = checkpoint.split('/')[-1] if checkpoint.find('checkpoint') != -1 else ""
@@ -617,7 +621,7 @@ def main():
         if not os.path.exists(pruned_path):
             os.makedirs(pruned_path)
         model_to_save.save_pretrained(pruned_path)
-        logger.info("Saving model checkpoint to %s", pruned_path)
+        # logger.info("Saving model checkpoint to %s", pruned_path)
 
         # Retrain
         print("--- Retraining ---")

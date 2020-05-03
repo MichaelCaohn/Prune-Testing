@@ -81,5 +81,9 @@ if _has_sklearn:
             return {"acc": simple_accuracy(preds, labels)}
         elif task_name == "twng":
             return {"acc": simple_accuracy(preds, labels)}
+        elif task_name == "imdb":
+            return {"acc": simple_accuracy(preds, labels)}
+        elif task_name == "imdbten":
+            return {"acc": simple_accuracy(preds, labels)}
         else:
             raise KeyError(task_name)

@@ -547,6 +547,76 @@ class TwngProcessor(DataProcessor):
                 InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
         return examples
 
+class ImdbProcessor(DataProcessor):
+    """Processor for the CoLA data set (GLUE version)."""
+
+    def get_example_from_tensor_dict(self, tensor_dict):
+        """See base class."""
+        return InputExample(tensor_dict['idx'].numpy(),
+                            tensor_dict['sentence'].numpy().decode('utf-8'),
+                            None,
+                            str(tensor_dict['label'].numpy()))
+
+    def get_train_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+
+    def get_labels(self):
+        """See base class."""
+        return ["0", "1"]
+
+    def _create_examples(self, lines, set_type):
+        """Creates examples for the training and dev sets."""
+        examples = []
+        for (i, line) in enumerate(lines):
+            guid = "%s-%s" % (set_type, i)
+            text_a = line[1]
+            label = line[0]
+            examples.append(
+                InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
+        return examples
+
+class ImdbTenProcessor(DataProcessor):
+    """Processor for the CoLA data set (GLUE version)."""
+
+    def get_example_from_tensor_dict(self, tensor_dict):
+        """See base class."""
+        return InputExample(tensor_dict['idx'].numpy(),
+                            tensor_dict['sentence'].numpy().decode('utf-8'),
+                            None,
+                            str(tensor_dict['label'].numpy()))
+
+    def get_train_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+
+    def get_labels(self):
+        """See base class."""
+        return ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+    def _create_examples(self, lines, set_type):
+        """Creates examples for the training and dev sets."""
+        examples = []
+        for (i, line) in enumerate(lines):
+            guid = "%s-%s" % (set_type, i)
+            text_a = line[1]
+            label = line[0]
+            examples.append(
+                InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
+        return examples
+
 glue_tasks_num_labels = {
     "cola": 2,
     "mnli": 3,
@@ -558,6 +628,8 @@ glue_tasks_num_labels = {
     "rte": 2,
     "wnli": 2,
     "twng": 20,
+    "imdb": 2,
+    "imdbten": 10,
 }
 
 glue_processors = {
@@ -572,6 +644,8 @@ glue_processors = {
     "rte": RteProcessor,
     "wnli": WnliProcessor,
     "twng": TwngProcessor,
+    "imdb": ImdbProcessor,
+    "imdbten": ImdbTenProcessor,
 }
 
 glue_output_modes = {
@@ -586,4 +660,6 @@ glue_output_modes = {
     "rte": "classification",
     "wnli": "classification",
     "twng": "classification",
+    "imdb": "classification",
+    "imdbten": "classification",
 }
